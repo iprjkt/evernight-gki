@@ -712,8 +712,11 @@ static inline u32 eval_this_adios_state(u32 state, u32 shift)
 static inline u32 eval_adios_state(struct adios_data *ad, u32 shift)
 { return eval_this_adios_state(get_adios_state(ad), shift); }
 
+static void insert_to_prio_queue(struct adios_data *ad,
+		struct request *rq, bool pq_idx);
+
 // Add a request to the deadline-sorted red-black tree
-static void add_to_dl_tree(
+static bool add_to_dl_tree(
 		struct adios_data *ad, bool dl_idx, struct request *rq) {
 	struct rb_root_cached *root = &ad->dl_tree[dl_idx];
 	struct rb_node **link = &(root->rb_root.rb_node), *parent = NULL;
@@ -758,8 +761,10 @@ static void add_to_dl_tree(
 	dlg = rb_entry_safe(parent, struct dl_group, node);
 	if (!dlg || dlg->deadline != deadline) {
 		dlg = kmem_cache_zalloc(ad->dl_group_pool, GFP_ATOMIC);
-		if (!dlg)
-			return;
+		if (!dlg) {
+			insert_to_prio_queue(ad, rq, 0);
+			return false;
+		}
 		dlg->deadline = deadline;
 		INIT_LIST_HEAD(&dlg->rqs);
 		rb_link_node(&dlg->node, parent, link);
@@ -771,6 +776,8 @@ found:
 
 	if (was_empty)
 		set_adios_state(ad, ADIOS_STATE_DL, dl_idx, true);
+
+	return true;
 }
 
 // Remove a request from the deadline-sorted red-black tree
@@ -846,7 +853,11 @@ static void adios_request_merged(struct request_queue *q, struct request *req,
 
 	// Reposition request in the deadline-sorted tree
 	del_from_dl_tree(ad, dl_idx, req);
-	add_to_dl_tree(ad, dl_idx, req);
+	if (!add_to_dl_tree(ad, dl_idx, req)) {
+		elv_rqhash_del(q, req);
+		if (q->last_merge == req)
+			q->last_merge = NULL;
+	}
 }
 
 // Handle merging of requests after one has been merged into another
@@ -889,7 +900,8 @@ static bool merge_or_insert_to_dl_tree(struct adios_data *ad,
 		return true;
 
 	bool dl_idx = adios_optype_not_read(rq);
-	add_to_dl_tree(ad, dl_idx, rq);
+	if (!add_to_dl_tree(ad, dl_idx, rq))
+		return false;
 
 	if (rq_mergeable(rq)) {
 		elv_rqhash_add(q, rq);
@@ -904,12 +916,14 @@ static void insert_to_prio_queue(struct adios_data *ad,
 		struct request *rq, bool pq_idx) {
 	struct adios_rq_data *rd = get_rq_data(rq);
 
-	/* We're sure that rd->managed == true */
-	union adios_in_flight_rqs ifr = {
-		.count          = 1,
-		.total_pred_lat = rd->pred_lat,
-	};
-	atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
+	if (!rd->managed) {
+		union adios_in_flight_rqs ifr = {
+			.count          = 1,
+			.total_pred_lat = rd->pred_lat,
+		};
+		atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
+		rd->managed = true;
+	}
 
 	scoped_guard(spinlock_irqsave, &ad->pq_lock) {
 		bool was_empty = list_empty(&ad->prio_queue[pq_idx]);
@@ -928,7 +942,6 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 	u8 optype = adios_optype(rq);
 	bool rq_is_flush;
 
-	rd->managed = true;
 	rd->block_size = blk_rq_bytes(rq);
 	rd->pred_lat =
 		latency_model_predict(&ad->latency_model[optype], rd->block_size);
@@ -971,7 +984,6 @@ static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
 	u8 pq_idx = at_head ? 0 : 1;
 	bool stable = false;
 
-	rd->managed = true;
 	rd->block_size = blk_rq_bytes(rq);
 	rd->pred_lat =
 		latency_model_predict(&ad->latency_model[optype], rd->block_size);
@@ -1079,7 +1091,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 	u8  dest_idx;
 	u64 added_lat = 0;
 	u32 optype_count[ADIOS_OPTYPES] = {0};
-	u32 count = 0;
+	u32 count = 0, in_flight_count = 0;
 	u8 optype;
 	bool page = !ad->bq_page, dl_idx, bias_idx, update_bias;
 	u32 dl_queued;
@@ -1146,6 +1158,14 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 					adios_prio_to_wmult[ad->dl_prio[bias_idx] + 20]) >> 10);
 		}
 
+		/*
+		 * Set ADIOS_STATE_BQ before remove_request() can clear
+		 * ADIOS_STATE_DL so ad->state never transiently drops to 0
+		 * while requests are moving from dl_tree to batch_queue.
+		 */
+		if (!count)
+			set_adios_state(ad, ADIOS_STATE_BQ, page, true);
+
 		remove_request(ad, rq);
 
 		// Add request to the corresponding batch queue
@@ -1156,7 +1176,11 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 		ad->bq_state[page] |= 1U << dest_idx;
 		ad->batch_count[page][optype]++;
 		optype_count[optype]++;
-		added_lat += rd->pred_lat;
+		if (!rd->managed) {
+			rd->managed = true;
+			added_lat += rd->pred_lat;
+			in_flight_count++;
+		}
 		count++;
 	}} while (!stop);
 
@@ -1164,14 +1188,13 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 			list_sort(NULL, &ad->batch_queue[page][1], cmp_rq_pos);
 
 	if (count) {
-		/* We're sure that every request's rd->managed == true */
-		union adios_in_flight_rqs ifr = {
-			.count          = count,
-			.total_pred_lat = added_lat,
-		};
-		atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
-
-		set_adios_state(ad, ADIOS_STATE_BQ, page, true);
+		if (in_flight_count) {
+			union adios_in_flight_rqs ifr = {
+				.count          = in_flight_count,
+				.total_pred_lat = added_lat,
+			};
+			atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
+		}
 
 		for (optype = 0; optype < ADIOS_OPTYPES; optype++)
 			if (ad->batch_actual_max_size[optype] < optype_count[optype])
@@ -1288,7 +1311,10 @@ static struct request *dispatch_from_pq(struct adios_data *ad) {
 
 	guard(spinlock_irqsave)(&ad->pq_lock);
 	u32 pq_state = eval_adios_state(ad, ADIOS_STATE_PQ);
-	u8  pq_idx = pq_state >> 1;
+	if (!pq_state)
+		return NULL;
+
+	u8  pq_idx = !(pq_state & 0x1);
 	struct list_head *q = &ad->prio_queue[pq_idx];
 
 	if (unlikely(list_empty(q))) return NULL;
@@ -1399,7 +1425,7 @@ static void adios_completed_request(struct request *rq, u64 now) {
 	struct adios_rq_data *rd = get_rq_data(rq);
 	union adios_in_flight_rqs ifr = { .scalar = 0 };
 
-	if (op_is_flush(rq->cmd_flags) || !rd)
+	if (!rd)
 		return;
 
 	if (rd->managed) {
@@ -1407,9 +1433,13 @@ static void adios_completed_request(struct request *rq, u64 now) {
 			.count          = 1,
 			.total_pred_lat = rd->pred_lat,
 		};
+		rd->managed = false;
 		ifr.scalar = atomic64_sub_return(
 			ifr_to_sub.scalar, &ad->in_flight_rqs.atomic);
 	}
+
+	if (op_is_flush(rq->cmd_flags))
+		return;
 	u8 optype = adios_optype(rq);
 
 	unsigned long flags;
@@ -1461,13 +1491,38 @@ static void adios_completed_request(struct request *rq, u64 now) {
 	timer_reduce(&ad->update_timer, jiffies + msecs_to_jiffies(100));
 }
 
+// Release in-flight accounting when a request is requeued by the block layer
+static void adios_requeue_request(struct request *rq) {
+	struct adios_data *ad = rq->q->elevator->elevator_data;
+	struct adios_rq_data *rd = get_rq_data(rq);
+
+	if (rd && rd->managed) {
+		union adios_in_flight_rqs ifr_to_sub = {
+			.count          = 1,
+			.total_pred_lat = rd->pred_lat,
+		};
+		rd->managed = false;
+		atomic64_sub(ifr_to_sub.scalar, &ad->in_flight_rqs.atomic);
+	}
+}
+
 // Clean up after a request is finished
 static void adios_finish_request(struct request *rq) {
 	struct adios_data *ad = rq->q->elevator->elevator_data;
 
 	if (rq->elv.priv[0]) {
+		struct adios_rq_data *rd = get_rq_data(rq);
+
+		if (rd->managed) {
+			union adios_in_flight_rqs ifr_to_sub = {
+				.count          = 1,
+				.total_pred_lat = rd->pred_lat,
+			};
+			rd->managed = false;
+			atomic64_sub(ifr_to_sub.scalar, &ad->in_flight_rqs.atomic);
+		}
 		// Free adios_rq_data back to the memory pool
-		mempool_free(get_rq_data(rq), ad->rq_data_pool);
+		mempool_free(rd, ad->rq_data_pool);
 		rq->elv.priv[0] = NULL;
 	}
 }
@@ -2032,6 +2087,7 @@ static struct elevator_type mq_adios = {
 		.insert_requests	= adios_insert_requests,
 		.prepare_request	= adios_prepare_request,
 		.dispatch_request	= adios_dispatch_request,
+		.requeue_request	= adios_requeue_request,
 		.completed_request	= adios_completed_request,
 		.finish_request		= adios_finish_request,
 		.has_work			= adios_has_work,
