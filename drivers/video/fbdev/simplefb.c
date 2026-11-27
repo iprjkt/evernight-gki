@@ -18,6 +18,9 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#ifdef CONFIG_BOOT_CONFIG
+#include <linux/bootconfig.h>
+#endif
 #include <linux/platform_data/simplefb.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
@@ -722,6 +725,16 @@ static void __init simplefb_register_mtk_lk(void)
 
 	if (!of_chosen)
 		return;
+
+#ifdef CONFIG_BOOT_CONFIG
+	{
+		const char *normal_boot;
+
+		normal_boot = xbc_find_value("androidboot.force_normal_boot", NULL);
+		if (!normal_boot || strcmp(normal_boot, "1") != 0)
+			return;
+	}
+#endif
 
 	if (of_property_read_u32(of_chosen, "atag,videolfb-islcmfound",
 				 &islcmfound) == 0 && !islcmfound)
