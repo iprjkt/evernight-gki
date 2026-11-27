@@ -15,15 +15,21 @@
 #include <linux/errno.h>
 #include <linux/fb.h>
 #include <linux/io.h>
+#include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/platform_data/simplefb.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_clk.h>
 #include <linux/of_platform.h>
 #include <linux/parser.h>
 #include <linux/regulator/consumer.h>
+#ifdef CONFIG_ARM64
+#include <asm/cacheflush.h>
+#endif
 
 static const struct fb_fix_screeninfo simplefb_fix = {
 	.id		= "simple",
@@ -69,13 +75,13 @@ static int simplefb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 struct simplefb_par;
 static void simplefb_clocks_destroy(struct simplefb_par *par);
 static void simplefb_regulators_destroy(struct simplefb_par *par);
+static void simplefb_unmap(struct fb_info *info);
 
 static void simplefb_destroy(struct fb_info *info)
 {
 	simplefb_regulators_destroy(info->par);
 	simplefb_clocks_destroy(info->par);
-	if (info->screen_base)
-		iounmap(info->screen_base);
+	simplefb_unmap(info);
 }
 
 static const struct fb_ops simplefb_ops = {
@@ -86,6 +92,138 @@ static const struct fb_ops simplefb_ops = {
 	.fb_copyarea	= cfb_copyarea,
 	.fb_imageblit	= cfb_imageblit,
 };
+
+#ifdef CONFIG_ARM64
+static atomic_t simplefb_disabled = ATOMIC_INIT(0);
+
+static void simplefb_flush_rows(struct fb_info *info, u32 dy, u32 height)
+{
+	unsigned long offset, len;
+
+	if (!info->screen_base || !height || dy >= info->var.yres_virtual)
+		return;
+	if (dy + height > info->var.yres_virtual)
+		height = info->var.yres_virtual - dy;
+
+	offset = (unsigned long)dy * info->fix.line_length;
+	len = (unsigned long)height * info->fix.line_length;
+	if (offset >= info->fix.smem_len)
+		return;
+	if (offset + len > info->fix.smem_len)
+		len = info->fix.smem_len - offset;
+
+	__clean_dcache_area_poc((void __force *)info->screen_base + offset, len);
+}
+
+static void simplefb_fill_u32(u32 *dst, u32 val, size_t count)
+{
+	while (count--)
+		*dst++ = val;
+}
+
+static void simplefb_ram_fillrect(struct fb_info *info,
+				  const struct fb_fillrect *rect)
+{
+	if (atomic_read(&simplefb_disabled))
+		return;
+
+	if (rect->rop == ROP_COPY && info->var.bits_per_pixel == 32 &&
+	    rect->color == 0 && rect->dx < info->var.xres_virtual &&
+	    rect->dy < info->var.yres_virtual) {
+		u32 width = min(rect->width, info->var.xres_virtual - rect->dx);
+		u32 height = min(rect->height, info->var.yres_virtual - rect->dy);
+		u8 *base = (u8 __force *)info->screen_base;
+		u32 stride = info->fix.line_length;
+		u32 row_bytes = width * 4;
+		u32 bg = 0xFF000000U;
+
+		if (rect->dx == 0 &&
+		    (row_bytes == stride || width == info->var.xres)) {
+			simplefb_fill_u32((u32 *)(base + (unsigned long)rect->dy * stride),
+					  bg, ((unsigned long)height * stride) / 4);
+		} else {
+			u32 y;
+
+			for (y = 0; y < height; y++)
+				simplefb_fill_u32((u32 *)(base + (unsigned long)(rect->dy + y) * stride +
+						  (unsigned long)rect->dx * 4), bg, width);
+		}
+	} else {
+		cfb_fillrect(info, rect);
+	}
+	simplefb_flush_rows(info, rect->dy, rect->height);
+}
+
+static void simplefb_ram_copyarea(struct fb_info *info,
+				  const struct fb_copyarea *area)
+{
+	if (atomic_read(&simplefb_disabled))
+		return;
+
+	if (info->var.bits_per_pixel == 32 &&
+	    area->dx < info->var.xres_virtual &&
+	    area->sx < info->var.xres_virtual &&
+	    area->dy < info->var.yres_virtual &&
+	    area->sy < info->var.yres_virtual) {
+		u32 max_w = min(info->var.xres_virtual - area->dx,
+				info->var.xres_virtual - area->sx);
+		u32 max_h = min(info->var.yres_virtual - area->dy,
+				info->var.yres_virtual - area->sy);
+		u32 width = min(area->width, max_w);
+		u32 height = min(area->height, max_h);
+		u8 *base = (u8 __force *)info->screen_base;
+		u32 stride = info->fix.line_length;
+		u32 row_bytes = width * 4;
+
+		if (area->dx == 0 && area->sx == 0 &&
+		    (row_bytes == stride || width == info->var.xres)) {
+			memmove(base + (unsigned long)area->dy * stride,
+				base + (unsigned long)area->sy * stride,
+				(unsigned long)height * stride);
+		} else if (area->dy > area->sy) {
+			u32 y;
+
+			for (y = height; y > 0; y--)
+				memmove(base + (unsigned long)(area->dy + y - 1) * stride +
+					(unsigned long)area->dx * 4,
+					base + (unsigned long)(area->sy + y - 1) * stride +
+					(unsigned long)area->sx * 4,
+					row_bytes);
+		} else {
+			u32 y;
+
+			for (y = 0; y < height; y++)
+				memmove(base + (unsigned long)(area->dy + y) * stride +
+					(unsigned long)area->dx * 4,
+					base + (unsigned long)(area->sy + y) * stride +
+					(unsigned long)area->sx * 4,
+					row_bytes);
+		}
+	} else {
+		cfb_copyarea(info, area);
+	}
+	simplefb_flush_rows(info, area->dy, area->height);
+}
+
+static void simplefb_ram_imageblit(struct fb_info *info,
+				   const struct fb_image *image)
+{
+	if (atomic_read(&simplefb_disabled))
+		return;
+
+	cfb_imageblit(info, image);
+	simplefb_flush_rows(info, image->dy, image->height);
+}
+
+static const struct fb_ops simplefb_ram_ops = {
+	.owner		= THIS_MODULE,
+	.fb_destroy	= simplefb_destroy,
+	.fb_setcolreg	= simplefb_setcolreg,
+	.fb_fillrect	= simplefb_ram_fillrect,
+	.fb_copyarea	= simplefb_ram_copyarea,
+	.fb_imageblit	= simplefb_ram_imageblit,
+};
+#endif
 
 static struct simplefb_format simplefb_formats[] = SIMPLEFB_FORMATS;
 
@@ -171,6 +309,7 @@ static int simplefb_parse_pd(struct platform_device *pdev,
 
 struct simplefb_par {
 	u32 palette[PSEUDO_PALETTE_SIZE];
+	bool is_ram_map;
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 	bool clks_enabled;
 	unsigned int clk_count;
@@ -182,6 +321,20 @@ struct simplefb_par {
 	struct regulator **regulators;
 #endif
 };
+
+static void simplefb_unmap(struct fb_info *info)
+{
+	struct simplefb_par *par = info->par;
+
+	if (!info->screen_base)
+		return;
+
+	if (par && par->is_ram_map)
+		memunmap((void __force *)info->screen_base);
+	else
+		iounmap(info->screen_base);
+	info->screen_base = NULL;
+}
 
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 /*
@@ -458,8 +611,21 @@ static int simplefb_probe(struct platform_device *pdev)
 
 	info->fbops = &simplefb_ops;
 	info->flags = FBINFO_DEFAULT | FBINFO_MISC_FIRMWARE;
-	info->screen_base = ioremap_wc(info->fix.smem_start,
-				       info->fix.smem_len);
+#ifdef CONFIG_ARM64
+	if (pfn_valid(__phys_to_pfn(info->fix.smem_start))) {
+		info->screen_base = (void __iomem *)memremap(info->fix.smem_start,
+							     info->fix.smem_len,
+							     MEMREMAP_WB);
+		if (info->screen_base) {
+			par->is_ram_map = true;
+			info->fbops = &simplefb_ram_ops;
+		}
+	} else
+#endif
+	{
+		info->screen_base = ioremap_wc(info->fix.smem_start,
+					       info->fix.smem_len);
+	}
 	if (!info->screen_base) {
 		ret = -ENOMEM;
 		goto error_fb_release;
@@ -500,7 +666,7 @@ error_regulators:
 error_clocks:
 	simplefb_clocks_destroy(par);
 error_unmap:
-	iounmap(info->screen_base);
+	simplefb_unmap(info);
 error_fb_release:
 	framebuffer_release(info);
 	return ret;
@@ -531,26 +697,127 @@ static struct platform_driver simplefb_driver = {
 	.remove = simplefb_remove,
 };
 
+#if defined(CONFIG_OF_ADDRESS) && defined(CONFIG_ARM64)
+static void __init simplefb_register_mtk_lk(void)
+{
+	struct device_node *np;
+	struct resource rmem, res;
+	struct simplefb_platform_data pd = {
+		.width = 1080,
+		.height = 2400,
+		.stride = ALIGN(1080, 32) * 4,
+		.format = "a8r8g8b8",
+	};
+	struct platform_device_info pdevinfo = {
+		.name = "simple-framebuffer",
+		.id = PLATFORM_DEVID_NONE,
+		.res = &res,
+		.num_res = 1,
+		.data = &pd,
+		.size_data = sizeof(pd),
+	};
+	struct platform_device *pdev;
+	resource_size_t fb_base, fb_size;
+	u32 islcmfound = 1, base_l = 0, base_h = 0;
+
+	if (!of_chosen)
+		return;
+
+	if (of_property_read_u32(of_chosen, "atag,videolfb-islcmfound",
+				 &islcmfound) == 0 && !islcmfound)
+		return;
+
+	np = of_find_compatible_node(NULL, NULL, "mediatek,framebuffer");
+	if (!np)
+		return;
+
+	if (of_address_to_resource(np, 0, &rmem)) {
+		of_node_put(np);
+		return;
+	}
+	of_node_put(np);
+
+	fb_base = rmem.start;
+	if (of_property_read_u32(of_chosen, "atag,videolfb-fb_base_l",
+				 &base_l) == 0) {
+		u64 atag_base;
+
+		of_property_read_u32(of_chosen, "atag,videolfb-fb_base_h",
+				     &base_h);
+		atag_base = ((u64)base_h << 32) | base_l;
+		if (atag_base >= rmem.start && atag_base < rmem.end)
+			fb_base = (resource_size_t)atag_base;
+	}
+
+	fb_size = (resource_size_t)pd.stride * pd.height;
+	if (fb_base + fb_size - 1 > rmem.end) {
+		pr_warn("simplefb: MTK LK framebuffer %pa+%pa exceeds reserved range %pR\n",
+			&fb_base, &fb_size, &rmem);
+		return;
+	}
+
+	res = (struct resource)DEFINE_RES_MEM(fb_base, fb_size);
+	pdev = platform_device_register_full(&pdevinfo);
+	if (IS_ERR(pdev))
+		pr_warn("simplefb: failed to register MTK LK framebuffer: %ld\n",
+			PTR_ERR(pdev));
+	else
+		pr_info("simplefb: registered MTK LK framebuffer at %pR (%ux%u, stride=%u)\n",
+			&res, pd.width, pd.height, pd.stride);
+}
+#else
+static void __init simplefb_register_mtk_lk(void) { }
+#endif
+
+#if defined(CONFIG_ARM64) && defined(CONFIG_MODULES)
+static int simplefb_module_notify(struct notifier_block *nb,
+				  unsigned long action, void *data)
+{
+	struct module *mod = data;
+
+	if (action == MODULE_STATE_COMING && mod &&
+	    strcmp(mod->name, "mediatek_drm") == 0) {
+		atomic_set(&simplefb_disabled, 1);
+		pr_info("simplefb: handing off display to %s\n", mod->name);
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block simplefb_module_nb = {
+	.notifier_call = simplefb_module_notify,
+};
+#endif
+
 static int __init simplefb_init(void)
 {
 	int ret;
 	struct device_node *np;
+	bool found_dt = false;
 
 	ret = platform_driver_register(&simplefb_driver);
 	if (ret)
 		return ret;
 
+#if defined(CONFIG_ARM64) && defined(CONFIG_MODULES)
+	register_module_notifier(&simplefb_module_nb);
+#endif
+
 	if (IS_ENABLED(CONFIG_OF_ADDRESS) && of_chosen) {
 		for_each_child_of_node(of_chosen, np) {
-			if (of_device_is_compatible(np, "simple-framebuffer"))
+			if (of_device_is_compatible(np, "simple-framebuffer")) {
 				of_platform_device_create(np, NULL, NULL);
+				found_dt = true;
+			}
 		}
+		if (!found_dt)
+			simplefb_register_mtk_lk();
 	}
 
 	return 0;
 }
 
-fs_initcall(simplefb_init);
+late_initcall_sync(simplefb_init);
 
 MODULE_AUTHOR("Stephen Warren <swarren@wwwdotorg.org>");
 MODULE_DESCRIPTION("Simple framebuffer driver");
